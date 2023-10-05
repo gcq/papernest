@@ -8,6 +8,7 @@ pyproj = "*"
 fastapi = "*"
 uvicorn = {extras = ["standard"], version = "*"}
 requests = "*"
+haversine = "*"
 
 [dev-packages]
 black = "*"

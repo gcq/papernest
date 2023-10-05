@@ -1,4 +1,5 @@
 from typing import Annotated, Literal, Optional, cast
+from typing_extensions import TypedDict
 
 import pyproj
 import fastapi
@@ -7,6 +8,8 @@ import pydantic
 import csv
 from pathlib import Path
 import sqlite3
+import enum
+import haversine
 
 
 def lambert93_to_gps(x: int, y: int):
@@ -19,6 +22,13 @@ def lambert93_to_gps(x: int, y: int):
         pyproj.Transformer.from_proj(lambert, wgs84).transform(x, y),
     )
     return long, lat
+
+
+class Operator(enum.IntEnum):
+    ORANGE = 20801
+    SFR = 20810
+    FREE = 20815
+    BOUYGUE = 20820
 
 
 class Geometry(pydantic.BaseModel):
@@ -50,6 +60,15 @@ class Feature(pydantic.BaseModel):
     properties: Properties
 
 
+Coverage = TypedDict(
+    "Coverage", {"2G": bool, "3G": bool, "4G": bool, "m_to_measurement": float}
+)
+
+
+class CoverageFeature(Feature):
+    coverage: dict[Literal["ORANGE", "SFR", "FREE", "BOUYGUE"], Coverage]
+
+
 def query_address(q: str):
     try:
         r = requests.get("https://api-adresse.data.gouv.fr/search", params={"q": q})
@@ -67,6 +86,32 @@ def query_address(q: str):
         )
 
 
+def extend_feature_with_coverage(f: Feature) -> CoverageFeature:
+    result_long, result_lat = f.geometry.coordinates
+    res = db.execute(
+        f"""
+        SELECT
+            operator, long, lat, _2G, _3G, _4G,
+            MIN((long-:long)*(long-:long) + (lat-:lat)*(lat-:lat)) AS distance
+        FROM coverage
+        GROUP BY operator
+        """,
+        {"long": result_long, "lat": result_lat},
+    )
+    coverage: dict[Literal["ORANGE", "SFR", "FREE", "BOUYGUE"], Coverage] = {}
+    for row in res.fetchall():
+        operator, long, lat, _2g, _3g, _4g, _distance = row
+        coverage[Operator(operator).name] = {
+            "2G": bool(_2g),
+            "3G": bool(_3g),
+            "4G": bool(_4g),
+            "m_to_measurement": haversine.haversine(
+                (result_lat, result_long), (lat, long), haversine.Unit.METERS
+            ),
+        }
+    return CoverageFeature(**f.model_dump(), coverage=coverage)
+
+
 def load_csv():
     db_name = "coverage.db"
 
@@ -79,8 +124,8 @@ def load_csv():
         """
     CREATE TABLE coverage (
         operator INT,
-        x REAL,
-        y REAL,
+        long REAL,
+        lat REAL,
         _2G BOOL,
         _3G BOOl,
         _4G BOOL
@@ -98,8 +143,8 @@ def load_csv():
     db.execute("BEGIN TRANSACTION")
     for i, row in enumerate(rows):
         orig_x, orig_y = row["x"], row["y"]
-        x, y = lambert93_to_gps(int(orig_x), int(orig_y))
-        row["x"], row["y"] = x, y
+        long, lat = lambert93_to_gps(int(orig_x), int(orig_y))
+        row["x"], row["y"] = long, lat
         db.execute("INSERT INTO coverage VALUES (?, ?, ?, ?, ?, ?)", list(row.values()))
         if i % 1000 == 0:
             print(f"{i}/{_total}")
@@ -108,11 +153,11 @@ def load_csv():
     return db
 
 
-load_csv()
+db = load_csv()
 
 app = fastapi.FastAPI()
 
 
 @app.get("/coverage")
-async def get(q: Annotated[str, fastapi.Query()]):
-    return query_address(q)
+async def get(q: Annotated[str, fastapi.Query()]) -> list[CoverageFeature]:
+    return [extend_feature_with_coverage(f) for f in query_address(q)]
