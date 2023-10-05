@@ -9,6 +9,7 @@ fastapi = "*"
 uvicorn = {extras = ["standard"], version = "*"}
 requests = "*"
 haversine = "*"
+tqdm = "*"
 
 [dev-packages]
 black = "*"
